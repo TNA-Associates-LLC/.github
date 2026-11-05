@@ -2,9 +2,9 @@
 
 ## Issue
 Closes #<n>
-<!-- Partial work: "Part of #<n>". Another repo: "Closes TNA-Associates-LLC/<repo>#<n>".
+<!-- Partial work: "Part of #<n>" or "Refs #<n>". Another repo: "Closes TNA-Associates-LLC/<repo>#<n>".
      Keywords only close an issue when this PR merges into the default branch;
-     PRs into hub or integration branches use "Part of". -->
+     PRs into hub or integration branches use "Part of #<n>" or "Refs #<n>". -->
 
 ## What changes
 <!-- One or two lines per file or area. -->
