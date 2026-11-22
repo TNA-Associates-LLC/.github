@@ -1,0 +1,68 @@
+# Reusable workflow: check a repo's .claude skills, agents and commands against the documented front-matter keys
+# and the estate rules (TNA-Associates-LLC/control-plane#331).
+#
+# Callers (one per client repo, PR trigger only per the global CI budget rule):
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened]
+#       branches: [staging, main]
+#   jobs:
+#     cc-config-lint:
+#       uses: TNA-Associates-LLC/.github/.github/workflows/cc-config-lint.yml@main
+# Required check name on the caller's branches: "cc-config-lint / check".
+#
+# The checker is scripts/check-claude-config in this repo: a byte-identical copy of control-plane's
+# scripts/check-claude-config at 7b2a312aa7d02dd36c163fa0c0f0359eadcd36b8. control-plane is private and a caller's
+# GITHUB_TOKEN reaches only the caller repo, so the checker lives here; the sha256 below pins its content, and the
+# job fails closed if the file changes without the pin. To update: copy the file again and change checker-sha256.
+name: cc-config-lint
+
+on:
+  workflow_call:
+    inputs:
+      lint-ref:
+        description: Ref of TNA-Associates-LLC/.github to take the checker from
+        type: string
+        default: main
+      checker-sha256:
+        description: Expected sha256 of scripts/check-claude-config (control-plane 7b2a312)
+        type: string
+        default: 30afdaf9e5cfe829cfbdb7f4d9a954ab34a965b0614fa894f4dac95b977c4c4b
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the calling repo
+        uses: actions/checkout@v4
+
+      - name: Check out the checker
+        uses: actions/checkout@v4
+        with:
+          repository: TNA-Associates-LLC/.github
+          ref: ${{ inputs.lint-ref }}
+          path: .cc-lint
+          sparse-checkout: scripts/check-claude-config
+          sparse-checkout-cone-mode: false
+
+      - name: Verify the checker is the pinned version
+        shell: bash
+        env:
+          WANT: ${{ inputs.checker-sha256 }}
+        run: |
+          set -uo pipefail
+          got="$(sha256sum .cc-lint/scripts/check-claude-config | cut -d' ' -f1)"
+          echo "checker sha256: $got"
+          [ "$got" = "$WANT" ] || { echo "::error::checker sha256 $got does not match the pin $WANT"; exit 1; }
+
+      - name: Run check-claude-config
+        shell: bash
+        run: |
+          set -uo pipefail
+          rm -rf .cc-lint/.git
+          bash .cc-lint/scripts/check-claude-config "$GITHUB_WORKSPACE"

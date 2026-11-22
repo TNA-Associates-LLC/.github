@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# check-claude-config -- check .claude skills, agents and commands against the documented front-matter keys
+# and the estate naming rules (control-plane#331).
+#
+# Usage: scripts/check-claude-config [--quiet] <repo-root> [<repo-root> ...]
+#   Checks <root>/.claude/{skills/*/SKILL.md,agents/*.md,commands/*.md} and the same under <root>/plugins/*/.
+#   Prints one FAIL line per finding, then a summary per root. Exit 0 when every file passes, 1 otherwise, 2 on usage.
+#   Read-only: it never writes to the repos it checks.
+#
+# Key sets: code.claude.com/docs/en/skills "Frontmatter reference" (20 keys) and /sub-agents "Frontmatter
+# reference" (19 keys), mirrored in docs/reference/claude-code/pages/{skills,sub-agents}.md. Commands take the
+# skill keys except `name` and `paths` (/skills: "It supports the same frontmatter except name and paths").
+# Claude Code ignores unknown keys silently, so an unknown key is a FAIL here rather than a silent no-op.
+#
+# Estate rules (#331, audit 2026-11-22): name is lowercase-hyphen (an `L<n>-` prefix is allowed) and matches the
+# skill folder or agent file name; description present; banned keys owner, updated, status and metadata.owner;
+# an agent described as read-only must set `tools`; no legacy TodoWrite or MultiEdit in tool lists.
+set -uo pipefail
+
+SKILL_KEYS=" name description when_to_use argument-hint arguments disable-model-invocation user-invocable allowed-tools disallowed-tools model effort context agent background hooks paths shell metadata license compatibility "
+AGENT_KEYS=" name description tools disallowedTools model permissionMode maxTurns autoCompactWindow skills mcpServers hooks memory background omitClaudeMd effort isolation color initialPrompt experimental "
+COMMAND_KEYS="${SKILL_KEYS/ name / }"; COMMAND_KEYS="${COMMAND_KEYS/ paths / }"
+BANNED=" owner updated status "
+NAME_RE='^(L[0-9]+-)?[a-z0-9]+(-[a-z0-9]+)*$'
+
+quiet=0
+[ "${1:-}" = "--quiet" ] && { quiet=1; shift; }
+[ "$#" -ge 1 ] || { echo "usage: check-claude-config [--quiet] <repo-root> ..." >&2; exit 2; }
+
+total_fail=0
+
+# frontmatter <file>: print the lines between the opening '---' on line 1 and the next '---'; return 1 if absent
+frontmatter(){ awk 'NR==1 && $0!="---" {exit 3} NR==1 {next} $0=="---" {found=1; exit} {print} END {if (!found) exit 3}' "$1"; }
+
+# value <frontmatter> <key>: the scalar after "key:" on its line, quotes stripped ("" for a block scalar or list)
+value(){ printf '%s\n' "$1" | awk -v k="$2" 'index($0, k":")==1 {v=substr($0, length(k)+2); sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v); gsub(/^["'\'']|["'\'']$/, "", v); print v; exit}'; }
+
+# block <frontmatter> <key>: the key's own value plus its indented continuation lines (lists, folded text)
+block(){ printf '%s\n' "$1" | awk -v k="$2" 'index($0, k":")==1 {on=1; print substr($0, length(k)+2); next} on && /^[ \t]/ {print; next} on {exit}'; }
+
+check_file(){ # <kind> <file> <expected-name>
+  local kind="$1" f="$2" want="$3" fm keys k allowed name desc tl fails=()
+  if ! fm="$(frontmatter "$f")"; then fails+=("no front matter: line 1 must be '---' and the block must close with '---'")
+  else
+    keys="$(printf '%s\n' "$fm" | grep -oE '^[A-Za-z_][A-Za-z0-9_-]*:' | tr -d ':')"
+    case "$kind" in skill) allowed="$SKILL_KEYS";; agent) allowed="$AGENT_KEYS";; command) allowed="$COMMAND_KEYS";; esac
+    for k in $keys; do
+      if [[ "$BANNED" == *" $k "* ]]; then fails+=("banned key: $k")
+      elif [[ "$allowed" != *" $k "* ]]; then fails+=("undocumented $kind key: $k")
+      fi
+    done
+    if printf '%s\n' "$keys" | grep -qx metadata && block "$fm" metadata | grep -qE '^[ \t]+owner:'; then fails+=("banned key: metadata.owner"); fi
+
+    name="$(value "$fm" name)"
+    if [ "$kind" = agent ] && [ -z "$name" ]; then fails+=("agent has no name")
+    fi
+    if [ -n "$name" ]; then
+      [[ "$name" =~ $NAME_RE ]] || fails+=("name '$name' is not lowercase-hyphen (an L<n>- prefix is allowed)")
+      [ "$name" = "$want" ] || fails+=("name '$name' does not match its $([ "$kind" = skill ] && echo folder || echo file) '$want'")
+    fi
+    [[ "$want" =~ $NAME_RE ]] || fails+=("$([ "$kind" = skill ] && echo folder || echo file) name '$want' is not lowercase-hyphen")
+
+    desc="$(block "$fm" description | tr '\n' ' ' | sed -E 's/^[ \t>|-]+//; s/[ \t]+$//')"
+    [ -n "$desc" ] || fails+=("description missing or empty")
+
+    if [ "$kind" = agent ] && printf '%s' "$desc" | grep -qi 'read-only' && ! printf '%s\n' "$keys" | grep -qx tools; then
+      fails+=("described as read-only but sets no tools list (it inherits every tool)")
+    fi
+    tl="$(for k in tools allowed-tools disallowedTools disallowed-tools; do block "$fm" "$k"; done)"
+    printf '%s' "$tl" | grep -qE '(^|[^A-Za-z])(TodoWrite|MultiEdit)([^A-Za-z]|$)' && fails+=("legacy tool name in a tool list (TodoWrite or MultiEdit)")
+  fi
+  local m
+  for m in "${fails[@]+"${fails[@]}"}"; do echo "FAIL $f: $m"; done
+  return "${#fails[@]}"
+}
+
+for root in "$@"; do
+  root="$(cd "$root" 2>/dev/null && pwd -P)" || { echo "skip: not a directory: $root" >&2; continue; }
+  files=0; bad=0; n=0
+  # a repo keeps them under .claude/; a plugin keeps skills/, agents/ and commands/ at the plugin root
+  for d in "$root/.claude" "$root"/plugins/*; do
+    [ -d "$d" ] || continue
+    for f in "$d"/skills/*/SKILL.md; do [ -f "$f" ] || continue; files=$((files+1)); check_file skill "$f" "$(basename "$(dirname "$f")")"; n=$?; [ "$n" -gt 0 ] && bad=$((bad+1)) && total_fail=$((total_fail+n)); done
+    for f in "$d"/agents/*.md; do [ -f "$f" ] || continue; files=$((files+1)); check_file agent "$f" "$(basename "$f" .md)"; n=$?; [ "$n" -gt 0 ] && bad=$((bad+1)) && total_fail=$((total_fail+n)); done
+    for f in "$d"/commands/*.md; do [ -f "$f" ] || continue; files=$((files+1)); check_file command "$f" "$(basename "$f" .md)"; n=$?; [ "$n" -gt 0 ] && bad=$((bad+1)) && total_fail=$((total_fail+n)); done
+  done
+  [ "$quiet" -eq 1 ] || echo "SUMMARY $root: $files files, $bad failing"
+done
+[ "$total_fail" -eq 0 ]
